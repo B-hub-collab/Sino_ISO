@@ -1,0 +1,18 @@
+# 契約檢查系統 - 套件需求清單
+# 安裝方式: pip install -r requirements.txt
+
+# PDF 處理
+pdfplumber>=0.9.0
+PyMuPDF>=1.23.0
+
+# 圖資料庫
+neo4j>=5.14.0
+
+# Azure OpenAI
+openai>=1.10.0
+
+# 資料處理
+numpy>=1.24.0
+
+# GUI (通常Python內建，但列出以確保)
+# tkinter 是 Python 內建套件，無需額外安裝

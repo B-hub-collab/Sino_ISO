@@ -1,0 +1,35 @@
+{
+  "_comment": "這是設定檔範本，請複製為 config.json 並填入實際資訊",
+  "_note": "config.json 不會被打包進exe，首次執行時會引導使用者填寫",
+
+  "neo4j": {
+    "uri": "neo4j+s://your-instance.databases.neo4j.io",
+    "username": "neo4j",
+    "password": "your_neo4j_password_here"
+  },
+
+  "azure_openai": {
+    "endpoint": "https://your-instance.openai.azure.com/",
+    "api_key": "your_azure_api_key_here",
+    "api_version": "2025-01-01-preview",
+    "deployment_name": "o4-mini"
+  },
+
+  "app_settings": {
+    "default_output_folder": "output",
+    "skip_strikethrough": true,
+    "skip_first_page_contract": true,
+    "skip_first_page_bidding": false,
+    "batch_size_embedding": 10,
+    "semantic_search_threshold": 0.5,
+    "semantic_search_top_k": 10,
+    "hybrid_search_top_k": 25
+  },
+
+  "project_types": {
+    "available_types": [
+      "project_management",
+      "design_supervision"
+    ]
+  }
+}
