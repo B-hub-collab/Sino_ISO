@@ -145,16 +145,12 @@ def pdf_to_hierarchical_json(pdf_file_path, output_json_path=None):
                                         check_item = val
                                         break
 
-                            # 條款：嘗試基準索引及其左邊的位置
+                            # 條款：只使用基準索引，不搜尋替代位置
+                            # 因為空白表單的「條款」欄位永遠是空的（要讓 AI 填寫）
+                            # 如果搜尋替代位置會誤抓到相鄰欄位的內容
                             clause = ""
                             if 'clause' in column_indices:
-                                for offset in [0, -1, -2]:
-                                    idx = base_clause_idx + offset
-                                    if idx >= 0:
-                                        val = extract_cell_value(row, idx, idx + 1)
-                                        if val:
-                                            clause = val
-                                            break
+                                clause = extract_cell_value(row, base_clause_idx, base_clause_idx + 1)
 
                             # 條款摘要：嘗試基準索引及其左邊的位置
                             clause_summary = ""
