@@ -23,7 +23,6 @@ MANIFEST
 
 # PyInstaller
 *.manifest
-*.spec
 
 # Local config
 config.json
@@ -38,4 +37,7 @@ output/
 # Build artifacts
 build/
 dist/
-*.spec
+
+# Test files
+test_output.docx
+pdf_output*.json

@@ -14,5 +14,8 @@ openai>=1.10.0
 # 資料處理
 numpy>=1.24.0
 
+# Word 文件處理
+python-docx>=0.8.11
+
 # GUI (通常Python內建，但列出以確保)
 # tkinter 是 Python 內建套件，無需額外安裝

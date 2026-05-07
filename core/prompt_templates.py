@@ -304,3 +304,116 @@ def get_keyword_extraction_hierarchy_prompt(main_description, parent_item, check
             關鍵字："""
 
     return prompt
+
+
+def get_full_content_extraction_prompt(main_description, parent_item, check_item, clauses_text,
+                                       project_management_checked=False, design_supervision_checked=True,
+                                       user_hint=""):
+    """
+    【軌二部專用】針對沒有條款摘要格式的項目，提取完整相關條文
+
+    此函數用於處理沒有預設條款摘要格式的檢核項目。
+    輸出格式：
+    - 條款：列出文件來源和章節號
+    - 條款摘要：列出完整的相關條文內容
+    - 備註：列出完整條文並解析
+
+    Args:
+        main_description (str): 主項說明
+        parent_item (str): 父項目檢查項目
+        check_item (str): 檢查項目
+        clauses_text (str): 相關條款文本
+        project_management_checked (bool): 是否勾選專管
+        design_supervision_checked (bool): 是否勾選設計及監造
+        user_hint (str): 使用者補充說明
+
+    Returns:
+        str: LLM prompt 或 "SKIP_ITEM"（如果應跳過）
+    """
+    # 判斷是否應跳過此項目
+    if should_skip_item(check_item, project_management_checked, design_supervision_checked):
+        return "SKIP_ITEM"
+
+    # 組織層次資訊
+    hierarchy_info = f"主項說明：{main_description}\n"
+    if parent_item:
+        hierarchy_info += f"父項目：{parent_item}\n"
+    hierarchy_info += f"檢查項目：{check_item}\n"
+
+    # 組織使用者補充說明
+    hint_section = ""
+    if user_hint:
+        hint_section = f"\n**使用者補充說明**：\n{user_hint}\n"
+
+    prompt = f"""你是專業的契約分析專家。請針對以下檢核項目，從提供的相關條款中提取完整的相關契約內容。
+
+{hierarchy_info}
+
+**相關條款**：
+{clauses_text}
+{hint_section}
+
+**任務要求**：
+
+本檢核項目**沒有預設的條款摘要格式**（如勾選框），因此需要以完整條文模式輸出。
+
+請嚴格按照以下格式輸出（**三個部分缺一不可**）：
+
+---
+**輸出格式**：
+
+條款：[列出所有相關條款的來源和章節號，用頓號分隔]
+
+條款摘要：[逐條列出完整的相關條文內容，保持原文]
+
+備註：[列出完整條文並進行專業解析]
+
+---
+
+**格式說明**：
+
+1. **條款**：
+   - 格式：「文件類型 + 章節號」
+   - 範例：「契約文件第5條、投標須知第三款、投標須知附錄A 條款2」
+   - 如果有多個條款，用頓號（、）分隔
+   - 如果未找到相關條款，填寫「無相關條款」
+
+2. **條款摘要**：
+   - 逐條列出完整的相關條文內容
+   - 保持原文，不要改寫
+   - 每條以「第X條：」或「第X款：」開頭，換行分隔
+   - 如果未找到相關條款，填寫「無」
+
+3. **備註**：
+   - 先列出完整條文（與條款摘要相同）
+   - 然後進行專業解析說明
+   - 說明該條款與檢核項目的關聯性
+   - 如有需要注意的重點，請列出
+
+**範例**：
+
+條款：契約文件第5條、投標須知第三款
+
+條款摘要：
+第5條：本契約採總包價法，承包商應於每月25日前提交當月估驗計價申請，機關應於收到申請後14日內完成審核並撥款。
+第三款：得標廠商應於開工前提送施工計畫書，經機關核可後方得開工。
+
+備註：
+相關條文內容：
+- 第5條：本契約採總包價法，承包商應於每月25日前提交當月估驗計價申請，機關應於收到申請後14日內完成審核並撥款。
+- 第三款：得標廠商應於開工前提送施工計畫書，經機關核可後方得開工。
+
+解析說明：
+本檢核項目「{check_item}」相關規定主要見於契約文件第5條和投標須知第三款。第5條明確規範了計價方式和支付時程，承包商需在每月25日前提交計價申請。第三款規定了開工前需完成施工計畫書審核。建議計畫依此時程規劃相關作業。
+
+---
+
+**重要提醒**：
+1. 務必按照上述三段式格式輸出
+2. 務必列出完整條文原文，不可省略或改寫
+3. 條款來源必須清楚標示文件類型和章節號
+4. 如果相關條款過多（超過5條），請選擇最相關的5條列出
+
+請開始分析："""
+
+    return prompt

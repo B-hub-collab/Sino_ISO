@@ -10,6 +10,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 import threading
 from pathlib import Path
+from datetime import datetime
 
 
 # 設定路徑，讓程式能找到 core 模組
@@ -33,12 +34,16 @@ sys.path.insert(0, str(CORE_DIR))
 # 動態匯入 core 模組
 try:
     from core import pdf2json, doc2graph, LLMcheck
+    from core import LLMcheck_railway  # 軌二部版本
+    from core import word_export_railway  # Word 報告輸出
     from core.project_type_selector import show_project_type_selector
     from core import per_item_hints
 except ImportError:
     import pdf2json
     import doc2graph
     import LLMcheck
+    import LLMcheck_railway  # 軌二部版本
+    import word_export_railway  # Word 報告輸出
     from project_type_selector import show_project_type_selector
     import per_item_hints
 
@@ -241,6 +246,12 @@ class ContractCheckerApp:
         self.appendix_a_pdf = tk.StringVar()
         self.checklist_json = tk.StringVar()
 
+        # 部門選擇（業務部 vs 軌二部）
+        self.department_var = tk.StringVar(value="business")  # 預設業務部
+
+        # 儲存最近的檢核結果（用於匯出）
+        self.latest_results = []
+
         # 確保輸出資料夾存在
         OUTPUT_DIR.mkdir(exist_ok=True)
 
@@ -395,7 +406,21 @@ class ContractCheckerApp:
         self.item_number_entry = ttk.Entry(item_frame, width=20)
         self.item_number_entry.pack(side=tk.LEFT, padx=5)
         self.item_number_entry.insert(0, "1")
-        ttk.Label(item_frame, text="(例如: 1, 1.1, 1.5 等)").pack(side=tk.LEFT, padx=5)
+        ttk.Label(item_frame, text="(例如: 1, 1.1, 1.5 等，留空則檢核全部)").pack(side=tk.LEFT, padx=5)
+
+        # 部門選擇
+        dept_frame = ttk.LabelFrame(frame, text="部門選擇", padding=10)
+        dept_frame.pack(fill=tk.X, pady=10)
+
+        ttk.Radiobutton(dept_frame, text="業務部 (標準模式)",
+                       variable=self.department_var,
+                       value="business").pack(side=tk.LEFT, padx=10)
+        ttk.Radiobutton(dept_frame, text="軌二部 (階層跳過模式)",
+                       variable=self.department_var,
+                       value="railway").pack(side=tk.LEFT, padx=10)
+
+        ttk.Label(dept_frame, text="※ 軌二部模式：有子項目時跳過父項目",
+                 foreground="gray").pack(side=tk.LEFT, padx=10)
 
         # 案件類型選擇
         type_frame = ttk.Frame(frame)
@@ -409,8 +434,14 @@ class ContractCheckerApp:
         ttk.Checkbutton(type_frame, text="設計及監造",
                        variable=self.design_supervision_var).pack(side=tk.LEFT, padx=10)
 
-        ttk.Button(frame, text="開始檢查",
-                  command=self.start_checking).pack(pady=10)
+        # 按鈕區域
+        button_frame = ttk.Frame(frame)
+        button_frame.pack(pady=10)
+
+        ttk.Button(button_frame, text="開始檢查",
+                  command=self.start_checking).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="匯出為 Word",
+                  command=self.export_to_word).pack(side=tk.LEFT, padx=5)
 
         # 結果顯示
         ttk.Label(frame, text="檢查結果:").pack(anchor=tk.W, pady=(10, 0))
@@ -446,6 +477,87 @@ class ContractCheckerApp:
                   command=self.clear_hint).pack(side=tk.LEFT, padx=5)
         ttk.Button(hint_button_frame, text="查看所有補充說明",
                   command=self.show_all_hints).pack(side=tk.LEFT, padx=5)
+
+    def get_llmcheck_module(self):
+        """根據部門選擇返回對應的 LLMcheck 模組
+
+        Returns:
+            module: LLMcheck (業務部) 或 LLMcheck_railway (軌二部)
+        """
+        department = self.department_var.get()
+        if department == "railway":
+            return LLMcheck_railway
+        else:
+            return LLMcheck
+
+    def _get_all_items_to_check(self, system):
+        """獲取所有需要檢核的項次
+
+        **重要**：為避免重複處理，只加入「頂層」項目。
+        - 如果父項目被處理，process_item() 會自動處理所有子項目
+        - 因此不需要再單獨加入子項目
+
+        根據部門不同：
+        - 業務部：有條款摘要的項目（父項目會自動處理子項目）
+        - 軌二部：只加入沒有子項目的葉子節點
+
+        Args:
+            system: JSONChecklistQuerySystem 實例
+
+        Returns:
+            list: 項次編號列表
+        """
+        items_to_check = []
+        department = self.department_var.get()
+
+        for main_item in system.checklist_data:
+            main_num = main_item.get('主項次', '')
+            main_summary = main_item.get('條款摘要', '').strip()
+            main_has_children = '子項目' in main_item and main_item['子項目']
+
+            if department == "railway":
+                # 軌二部：只處理沒有子項目的主項次
+                if not main_has_children and main_summary:
+                    items_to_check.append(main_num)
+                # 如果有子項目，遍歷子項目
+                elif main_has_children:
+                    for sub_item in main_item.get('子項目', []):
+                        sub_num = sub_item.get('項次', '')
+                        sub_has_children = '子項目' in sub_item and sub_item['子項目']
+
+                        if not sub_has_children:
+                            # 沒有子項目的子項次，加入列表
+                            items_to_check.append(sub_num)
+                        else:
+                            # 有子項目，遍歷子子項目
+                            for sub_sub_item in sub_item.get('子項目', []):
+                                sub_sub_num = sub_sub_item.get('項次', '')
+                                items_to_check.append(sub_sub_num)
+            else:
+                # 業務部：只加入最頂層的項目（process_item 會自動處理子項目）
+                if main_summary:
+                    # 主項次有條款摘要，加入（會自動處理所有子項目）
+                    items_to_check.append(main_num)
+                elif main_has_children:
+                    # 主項次沒有條款摘要，但有子項目，遍歷子項目
+                    for sub_item in main_item.get('子項目', []):
+                        sub_num = sub_item.get('項次', '')
+                        sub_summary = sub_item.get('條款摘要', '').strip()
+                        sub_has_children = '子項目' in sub_item and sub_item['子項目']
+
+                        if sub_summary:
+                            # 子項次有條款摘要，加入（會自動處理所有子子項目）
+                            items_to_check.append(sub_num)
+                        elif sub_has_children:
+                            # 子項次沒有條款摘要，但有子項目，遍歷子子項目
+                            for sub_sub_item in sub_item.get('子項目', []):
+                                sub_sub_num = sub_sub_item.get('項次', '')
+                                sub_sub_summary = sub_sub_item.get('條款摘要', '').strip()
+
+                                if sub_sub_summary:
+                                    items_to_check.append(sub_sub_num)
+
+        return items_to_check
 
     def select_checklist_pdf(self):
         """選擇測試表單PDF"""
@@ -679,9 +791,19 @@ class ContractCheckerApp:
 
         # 取得用戶輸入的項目編號
         item_number = self.item_number_entry.get().strip()
+
+        # 如果沒有輸入項次，詢問是否要檢核整份文件
         if not item_number:
-            messagebox.showwarning("警告", "請輸入檢查項目編號")
-            return
+            response = messagebox.askyesno(
+                "批量檢核",
+                "未輸入項次編號。\n\n是否要檢核整份文件的所有項目？\n\n注意：這可能需要較長時間。"
+            )
+            if not response:
+                return
+            # 標記為批量模式
+            batch_mode = True
+        else:
+            batch_mode = False
 
         def task():
             try:
@@ -692,8 +814,13 @@ class ContractCheckerApp:
                 neo4j_config = self.config_manager.get("neo4j")
                 azure_config = self.config_manager.get("azure_openai")
 
+                # 根據部門選擇取得對應的模組
+                LLMCheckModule = self.get_llmcheck_module()
+                department_name = "軌二部" if self.department_var.get() == "railway" else "業務部"
+                self.update_result(self.step3_result, f"使用 {department_name} 模式\n")
+
                 # 建立檢查系統
-                system = LLMcheck.JSONChecklistQuerySystem(
+                system = LLMCheckModule.JSONChecklistQuerySystem(
                     self.checklist_json.get(),
                     azure_config["endpoint"],
                     azure_config["api_key"],
@@ -722,25 +849,92 @@ class ContractCheckerApp:
                         system.store_embeddings_in_neo4j()
 
                 # 執行檢查
-                self.update_result(self.step3_result, f"\n開始檢查項目 {item_number}...\n")
-                self.update_result(self.step3_result, "="*60 + "\n")
-                self.status_bar.config(text=f"執行檢查項目 {item_number}...")
+                if batch_mode:
+                    # 批量模式：處理所有項目
+                    self.update_result(self.step3_result, "\n=== 批量檢核模式 ===\n")
+                    self.update_result(self.step3_result, "正在獲取所有檢核項目...\n")
 
-                result = system.process_item(
-                    item_number,
-                    deployment_name=azure_config.get("deployment_name", "o4-mini"),
-                    project_management_checked=self.project_management_var.get(),
-                    design_supervision_checked=self.design_supervision_var.get()
-                )
+                    # 獲取所有需要處理的項次
+                    all_items = self._get_all_items_to_check(system)
+                    total_count = len(all_items)
 
-                if result:
-                    # 顯示檢查結果
-                    self.display_check_result(result)
+                    self.update_result(self.step3_result, f"共 {total_count} 個項目需要檢核\n")
+                    self.update_result(self.step3_result, "="*60 + "\n\n")
 
-                system.close()
+                    all_results = []
+                    success_count = 0
+                    error_count = 0
 
-                self.status_bar.config(text="檢查完成")
-                messagebox.showinfo("完成", f"項目 {item_number} 檢查完成！")
+                    # 逐項處理
+                    for idx, item_num in enumerate(all_items, 1):
+                        try:
+                            self.update_result(self.step3_result, f"\n【{idx}/{total_count}】處理項次 {item_num}...\n")
+                            self.status_bar.config(text=f"處理 {idx}/{total_count}: {item_num}...")
+
+                            result = system.process_item(
+                                item_num,
+                                deployment_name=azure_config.get("deployment_name", "o4-mini"),
+                                project_management_checked=self.project_management_var.get(),
+                                design_supervision_checked=self.design_supervision_var.get()
+                            )
+
+                            if result:
+                                # 收集結果
+                                if isinstance(result, list):
+                                    all_results.extend(result)
+                                else:
+                                    all_results.append(result)
+                                success_count += 1
+                                self.update_result(self.step3_result, f"✓ 項次 {item_num} 完成\n")
+                            else:
+                                self.update_result(self.step3_result, f"⚠ 項次 {item_num} 無結果\n")
+
+                        except Exception as e:
+                            error_count += 1
+                            self.update_result(self.step3_result, f"✗ 項次 {item_num} 錯誤: {e}\n")
+
+                    # 儲存所有結果
+                    self.latest_results = all_results
+
+                    # 顯示摘要
+                    self.update_result(self.step3_result, f"\n{'='*60}\n")
+                    self.update_result(self.step3_result, f"批量檢核完成！\n")
+                    self.update_result(self.step3_result, f"成功: {success_count}/{total_count}\n")
+                    if error_count > 0:
+                        self.update_result(self.step3_result, f"失敗: {error_count}/{total_count}\n")
+                    self.update_result(self.step3_result, f"{'='*60}\n")
+
+                    system.close()
+                    self.status_bar.config(text="批量檢核完成")
+                    messagebox.showinfo("完成", f"批量檢核完成！\n\n成功: {success_count}/{total_count}\n失敗: {error_count}/{total_count}")
+
+                else:
+                    # 單項模式：處理指定項目
+                    self.update_result(self.step3_result, f"\n開始檢查項目 {item_number}...\n")
+                    self.update_result(self.step3_result, "="*60 + "\n")
+                    self.status_bar.config(text=f"執行檢查項目 {item_number}...")
+
+                    result = system.process_item(
+                        item_number,
+                        deployment_name=azure_config.get("deployment_name", "o4-mini"),
+                        project_management_checked=self.project_management_var.get(),
+                        design_supervision_checked=self.design_supervision_var.get()
+                    )
+
+                    if result:
+                        # 顯示檢查結果
+                        self.display_check_result(result)
+
+                        # 儲存結果供匯出使用
+                        if isinstance(result, list):
+                            self.latest_results = result
+                        else:
+                            self.latest_results = [result]
+
+                    system.close()
+
+                    self.status_bar.config(text="檢查完成")
+                    messagebox.showinfo("完成", f"項目 {item_number} 檢查完成！")
 
             except Exception as e:
                 import traceback
@@ -803,6 +997,66 @@ class ContractCheckerApp:
         text_widget.see(tk.END)
         text_widget.config(state='disabled')
 
+    def export_to_word(self):
+        """匯出檢核結果為 Word 報告"""
+        if not self.latest_results:
+            messagebox.showwarning("警告", "沒有可匯出的檢核結果，請先執行檢查")
+            return
+
+        if not self.checklist_json.get():
+            messagebox.showwarning("警告", "找不到檢查清單 JSON 檔案")
+            return
+
+        # 讓用戶選擇儲存位置
+        from tkinter import filedialog
+        default_filename = f"契約審查報告_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        output_path = filedialog.asksaveasfilename(
+            title="儲存 Word 報告",
+            defaultextension=".docx",
+            initialfile=default_filename,
+            filetypes=[("Word 文件", "*.docx"), ("所有檔案", "*.*")]
+        )
+
+        if not output_path:
+            return
+
+        def task():
+            try:
+                self.status_bar.config(text="正在生成 Word 報告...")
+
+                # 根據部門選擇使用對應的匯出方式
+                department = self.department_var.get()
+                if department == "railway":
+                    # 軌二部：不含封面頁，直接顯示檢核表格
+                    word_export_railway.export_to_word(
+                        self.latest_results,
+                        self.checklist_json.get(),  # 傳入 JSON 路徑
+                        output_path,
+                        project_name="契約審查報告（軌二部）",
+                        include_cover=False  # 軌二部不需要封面頁
+                    )
+                else:
+                    # 業務部：含封面頁（審查意見）
+                    word_export_railway.export_to_word(
+                        self.latest_results,
+                        self.checklist_json.get(),  # 傳入 JSON 路徑
+                        output_path,
+                        project_name="契約審查報告（業務部）",
+                        include_cover=True  # 業務部需要封面頁
+                    )
+
+                self.status_bar.config(text="Word 報告已生成")
+                messagebox.showinfo("成功", f"Word 報告已儲存至:\n{output_path}")
+
+            except Exception as e:
+                import traceback
+                error_msg = traceback.format_exc()
+                print(f"匯出錯誤:\n{error_msg}")
+                self.status_bar.config(text="匯出失敗")
+                messagebox.showerror("錯誤", f"匯出失敗: {e}")
+
+        threading.Thread(target=task, daemon=True).start()
+
     # === 補充修正區相關方法 ===
 
     def save_hint(self):
@@ -852,8 +1106,13 @@ class ContractCheckerApp:
                 neo4j_config = self.config_manager.get("neo4j")
                 azure_config = self.config_manager.get("azure_openai")
 
+                # 根據部門選擇取得對應的模組
+                LLMCheckModule = self.get_llmcheck_module()
+                department_name = "軌二部" if self.department_var.get() == "railway" else "業務部"
+                self.update_result(self.step3_result, f"使用 {department_name} 模式\n")
+
                 # 建立檢查系統
-                system = LLMcheck.JSONChecklistQuerySystem(
+                system = LLMCheckModule.JSONChecklistQuerySystem(
                     self.checklist_json.get(),
                     azure_config["endpoint"],
                     azure_config["api_key"],
