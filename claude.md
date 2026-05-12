@@ -230,6 +230,566 @@ Document (文件節點)
 
 ---
 
+## 檢索系統深度分析與優化
+
+### 當前檢索架構
+
+**三階段檢索流程**：
+```
+關鍵字提取（LLM）→ 混合搜尋（關鍵字 + 語義）→ 簡單評分 → LLM 分析
+```
+
+**核心組件**：
+1. **關鍵字提取**：使用 LLM 提取 3-8 個關鍵字（支援層次感知）
+2. **關鍵字搜尋**：Neo4j Cypher `CONTAINS` 查詢
+3. **語義搜尋**：text-embedding-3-small + 餘弦相似度
+4. **混合評分**：關鍵字 1.0 + 語義相似度 (0-1)
+
+### 核心問題與限制
+
+#### 問題 1：關鍵字搜尋缺乏評分機制（最嚴重）
+
+**當前實作** (`LLMcheck.py` 第 62-161 行)：
+```cypher
+WHERE ANY(keyword IN $keywords WHERE
+    toLower(c.title) CONTAINS toLower(keyword) OR
+    toLower(c.content) CONTAINS toLower(keyword))
+```
+
+**致命缺陷**：
+- ❌ 所有匹配結果權重相同，無法區分品質
+- ❌ 「保險」出現 1 次 = 出現 10 次（評分相同）
+- ❌ 標題匹配 = 內容隨意提及（評分相同）
+- ❌ 常見詞「契約」= 專業術語「專業責任險」（評分相同）
+- ❌ 缺乏 TF-IDF 和文檔長度正規化
+
+#### 問題 2：混合評分機制數學上不合理
+
+**當前邏輯** (`LLMcheck.py` 第 333-386 行)：
+```python
+# 關鍵字匹配：固定 1.0
+combined_results[key]['final_score'] = 1.0
+
+# 關鍵字 + 語義雙重匹配：1.0 + similarity
+combined_results[key]['final_score'] = 1.0 + clause['similarity_score']
+
+# 純語義匹配：similarity (0.0-1.0)
+combined_results[key]['final_score'] = clause['similarity_score']
+```
+
+**數學問題**：
+- ❌ 不同尺度的分數直接相加（1.0 固定值 + 0-1 連續值）
+- ❌ 任何關鍵字匹配必然高於純語義匹配（即使語義相似度 0.99）
+- ❌ 雙重匹配的優勢被過度放大
+- ❌ 缺乏正規化，不同查詢的分數分布差異巨大
+
+#### 問題 3：缺乏 Reranking 階段
+
+當前流程：
+```
+檢索 → 排序 → 送入 LLM
+```
+
+業界最佳實踐：
+```
+檢索 → 粗排（RRF）→ 精排（Cross-Encoder）→ 送入 LLM
+```
+
+**影響**：
+- ❌ 直接使用粗糙的混合分數排序
+- ❌ 未使用 Cross-Encoder 等更精確的重排模型
+- ❌ 無法考慮查詢與文檔的深層交互
+
+#### 問題 4：缺乏 Query Expansion
+
+當前直接使用 LLM 提取的關鍵字，未進行擴展：
+- 「專責險」 ≠ 「專業責任險」（應該匹配）
+- 「給付條件」 ≠ 「付款條件」（語義相同）
+- 「計價週期」 ≠ 「計價方式」（相關概念）
+
+### 改進方案與優先級
+
+#### 階段一：基礎優化（2 週，效果 +20-30%）
+
+##### 1. 實作 Reciprocal Rank Fusion (RRF) ⭐⭐⭐
+
+**優先級**：🔴 高 | **難度**：🟢 低 | **時間**：2-3 天
+
+**核心公式**：
+```
+RRF_score = Σ 1/(k + rank)  # k 通常為 60
+```
+
+**實作位置**：`LLMcheck.py` 第 333-386 行（替換 `hybrid_search` 方法）
+
+**優勢**：
+- 避免分數校準問題（不同檢索器的分數不可比）
+- 獎勵在多個檢索器中都排名靠前的文檔
+- 防止單一檢索器主導結果
+- 數學上更合理，業界標準方法
+
+**參考實作**：
+```python
+def reciprocal_rank_fusion(self, keyword_results, semantic_results, k=60):
+    """
+    使用 RRF 融合關鍵字和語義搜尋結果
+
+    Args:
+        keyword_results: 關鍵字搜尋結果（有排序）
+        semantic_results: 語義搜尋結果（已按相似度排序）
+        k: RRF 常數（預設 60）
+
+    Returns:
+        融合並排序的結果
+    """
+    rrf_scores = {}
+
+    # 為關鍵字結果計算 RRF 分數
+    for rank, result in enumerate(keyword_results, start=1):
+        key = f"{result['source']}_{result['number']}"
+        rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (k + rank)
+
+    # 為語義結果計算 RRF 分數
+    for rank, result in enumerate(semantic_results, start=1):
+        key = f"{result['source']}_{result['number']}"
+        rrf_scores[key] = rrf_scores.get(key, 0) + 1 / (k + rank)
+
+    # 合併結果並按 RRF 分數排序
+    # ... (詳細實作)
+```
+
+**配置參數**（新增至 `config.json`）：
+```json
+"retrieval_settings": {
+  "rrf_k": 60,
+  "rrf_weight_keyword": 1.0,
+  "rrf_weight_semantic": 1.0
+}
+```
+
+##### 2. 升級到 Neo4j BM25 ⭐⭐⭐
+
+**優先級**：🔴 高 | **難度**：🟡 中 | **時間**：3-5 天
+
+**BM25 優勢**：
+- 考慮詞頻（Term Frequency）和文檔長度正規化
+- 使用逆文檔頻率（IDF）降低常見詞權重
+- 數學基礎堅實，可解釋性強
+- Neo4j 5.13+ 原生支援
+
+**實作步驟**：
+
+1. 建立全文索引：
+```cypher
+CREATE FULLTEXT INDEX clause_fulltext
+FOR (c:Clause) ON EACH [c.title, c.content]
+```
+
+2. 修改搜尋查詢：
+```cypher
+CALL db.index.fulltext.queryNodes('clause_fulltext', $query)
+YIELD node, score
+RETURN node.number as number,
+       node.title as title,
+       node.content as content,
+       score as bm25_score
+ORDER BY score DESC
+LIMIT 50
+```
+
+**實作位置**：`LLMcheck.py` 第 62-161 行（替換 `find_related_clauses` 方法）
+
+**預期效果**：
+- 關鍵字檢索精準度 +15-20%
+- 減少無關結果 30-40%
+
+##### 3. Embedding 快取 ⭐⭐
+
+**優先級**：🟡 中 | **難度**：🟢 低 | **時間**：1-2 天
+
+**效果**：
+- 重複查詢速度 +50-80%
+- 減少 API 成本
+
+**實作方案**：
+```python
+from functools import lru_cache
+import hashlib
+
+class JSONChecklistQuerySystem:
+    def __init__(self, ...):
+        self.embedding_cache = {}
+
+    def get_cached_embedding(self, text):
+        """獲取快取的 embedding，避免重複計算"""
+        text_hash = hashlib.md5(text.encode()).hexdigest()
+
+        if text_hash in self.embedding_cache:
+            print(f"使用快取的 embedding: {text[:50]}...")
+            return self.embedding_cache[text_hash]
+
+        # 生成新 embedding
+        embedding = self.generate_embeddings([text])[0]
+        self.embedding_cache[text_hash] = embedding
+        return embedding
+```
+
+**配置**（新增至 `config.json`）：
+```json
+"cache_settings": {
+  "enable_embedding_cache": true,
+  "cache_size_limit": 1000
+}
+```
+
+---
+
+#### 階段二：進階優化（4 週，效果 +35-45%）
+
+##### 4. Cross-Encoder Reranking ⭐⭐⭐
+
+**優先級**：🔴 高 | **難度**：🔴 高 | **時間**：5-7 天
+
+**推薦模型**：
+- `cross-encoder/ms-marco-MiniLM-L-6-v2`（快速，適合生產）
+- `cross-encoder/ms-marco-electra-base`（更精確）
+
+**架構設計**：
+```python
+檢索 Top-100 → RRF 融合 Top-50 → Cross-Encoder 精排 Top-15 → LLM
+```
+
+**實作框架**：
+```python
+from sentence_transformers import CrossEncoder
+
+class JSONChecklistQuerySystem:
+    def __init__(self, ...):
+        # 初始化 Cross-Encoder（可選）
+        self.reranker = CrossEncoder('cross-encoder/ms-marco-MiniLM-L-6-v2')
+
+    def rerank_results(self, query, results, top_k=10):
+        """
+        使用 Cross-Encoder 重新排序檢索結果
+
+        Args:
+            query: 查詢文本
+            results: 初始檢索結果（RRF 融合後）
+            top_k: 返回前 K 個結果
+
+        Returns:
+            重新排序的結果
+        """
+        if not results or len(results) == 0:
+            return []
+
+        # 準備 (query, document) 對
+        pairs = []
+        for result in results[:50]:  # 只對前 50 個重排
+            doc_text = f"{result['title']} {result['content'][:500]}"
+            pairs.append([query, doc_text])
+
+        # Cross-Encoder 評分
+        scores = self.reranker.predict(pairs)
+
+        # 更新結果並重新排序
+        for i, score in enumerate(scores):
+            results[i]['rerank_score'] = float(score)
+
+        results.sort(key=lambda x: x.get('rerank_score', 0), reverse=True)
+        return results[:top_k]
+```
+
+**配置**（新增至 `config.json`）：
+```json
+"reranking_settings": {
+  "enable_reranking": true,
+  "reranker_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "rerank_top_k": 50,
+  "final_top_k": 15
+}
+```
+
+**注意事項**：
+- 需要安裝 `sentence-transformers`
+- 第一次使用會下載模型（約 90MB）
+- 如需離線使用，需預先下載模型
+
+**預期效果**：
+- 整體精準度 +10-15%
+- Top-5 準確率顯著提升
+
+##### 5. Multi-Query Generation ⭐⭐
+
+**優先級**：🟡 中 | **難度**：🟡 中 | **時間**：3-5 天
+
+**概念**（RAG-Fusion）：
+生成多個查詢變體，分別檢索後融合結果
+
+**實作方案**：
+```python
+def generate_query_variations(self, check_item, main_description, parent_item):
+    """
+    使用 LLM 生成查詢的多個變體
+
+    Returns:
+        List[str]: 3-5 個查詢變體
+    """
+    prompt = f"""你是專業的契約搜尋專家。請針對以下檢核項目，生成 3-5 個不同角度的搜尋查詢。
+
+主項說明：{main_description}
+父項目：{parent_item}
+檢查項目：{check_item}
+
+要求：
+1. 每個查詢從不同角度描述相同的需求
+2. 使用不同的術語和表達方式
+3. 包含同義詞和相關概念
+4. 一行一個查詢，不要編號
+
+範例：
+輸入：保險金額及自負額
+輸出：
+專業責任險的保險金額和自負額規定
+責任險投保金額與自負額限制
+保險理賠金額上限和免賠額設定
+
+請輸出查詢變體："""
+
+    response = self.llm_client.chat.completions.create(
+        model="o4-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    variations = response.choices[0].message.content.strip().split('\n')
+    variations = [v.strip() for v in variations if v.strip()]
+
+    # 加入原始查詢
+    original_query = f"{main_description} {parent_item} {check_item}".strip()
+    return [original_query] + variations
+```
+
+**預期效果**：
+- 召回率 +15-20%（特別是複雜查詢）
+- 減少漏檢情況
+
+##### 6. 自適應閾值 ⭐
+
+**優先級**：🟢 低 | **難度**：🟡 中 | **時間**：2-3 天
+
+**問題**：固定閾值 0.5 不適用所有查詢
+
+**解決方案**：
+```python
+def adaptive_semantic_search(self, query_text, min_results=5, max_results=20):
+    """
+    自適應語義搜尋，根據相似度分布動態調整閾值
+    """
+    # 1. 獲取 Top-100 結果
+    all_candidates = self.semantic_search(query_text, top_k=100, similarity_threshold=0.0)
+
+    if not all_candidates:
+        return []
+
+    # 2. 分析相似度分布
+    similarities = [c['similarity_score'] for c in all_candidates]
+    mean_sim = np.mean(similarities)
+    std_sim = np.std(similarities)
+
+    # 3. 動態閾值：mean + 0.5 * std（可調整）
+    adaptive_threshold = mean_sim + 0.5 * std_sim
+    adaptive_threshold = max(0.4, min(0.7, adaptive_threshold))  # 限制範圍
+
+    print(f"動態閾值：{adaptive_threshold:.3f} (mean={mean_sim:.3f}, std={std_sim:.3f})")
+
+    # 4. 過濾結果
+    filtered = [c for c in all_candidates if c['similarity_score'] >= adaptive_threshold]
+
+    # 5. 確保最少/最多結果數
+    if len(filtered) < min_results:
+        filtered = all_candidates[:min_results]
+    elif len(filtered) > max_results:
+        filtered = filtered[:max_results]
+
+    return filtered
+```
+
+---
+
+#### 階段三：長期優化（研究性質）
+
+##### 7. 建立評估框架 ⭐⭐
+
+**優先級**：🟡 中 | **難度**：🟡 中 | **時間**：7-10 天
+
+**目的**：持續優化的基礎設施
+
+**實作內容**：
+
+1. **建立測試集**：
+   - 收集 50-100 個真實檢查項目
+   - 人工標註相關條款（ground truth）
+
+2. **評估指標**：
+   - Recall@K：前 K 個結果中包含相關條款的比例
+   - Precision@K：前 K 個結果中相關條款的比例
+   - MRR（Mean Reciprocal Rank）：第一個相關結果的平均排名
+   - NDCG（Normalized Discounted Cumulative Gain）：考慮排名的整體品質
+
+3. **A/B 測試框架**：
+   - 對比不同檢索策略的效果
+   - 記錄每次改進的性能變化
+
+```python
+def evaluate_retrieval(test_cases, retrieval_method):
+    """
+    評估檢索系統性能
+
+    Args:
+        test_cases: List[Dict] - 測試案例 [{"query": ..., "relevant_clauses": [...]}]
+        retrieval_method: Callable - 檢索方法
+
+    Returns:
+        Dict: 評估指標
+    """
+    recalls = []
+    precisions = []
+    mrr_scores = []
+
+    for case in test_cases:
+        results = retrieval_method(case['query'])
+        retrieved_ids = [r['number'] for r in results[:10]]
+        relevant_ids = case['relevant_clauses']
+
+        # 計算 Recall@10
+        recall = len(set(retrieved_ids) & set(relevant_ids)) / len(relevant_ids)
+        recalls.append(recall)
+
+        # 計算 Precision@10
+        precision = len(set(retrieved_ids) & set(relevant_ids)) / len(retrieved_ids)
+        precisions.append(precision)
+
+        # 計算 MRR
+        for i, rid in enumerate(retrieved_ids, 1):
+            if rid in relevant_ids:
+                mrr_scores.append(1 / i)
+                break
+        else:
+            mrr_scores.append(0)
+
+    return {
+        'recall@10': np.mean(recalls),
+        'precision@10': np.mean(precisions),
+        'mrr': np.mean(mrr_scores)
+    }
+```
+
+##### 8. ColBERT 或 SPLADE ⭐
+
+**優先級**：🟢 低（研究性質） | **難度**：🔴 高 | **時間**：10-14 天
+
+**ColBERT**（Contextualized Late Interaction）：
+- 比 Bi-Encoder 更精確，比 Cross-Encoder 更快
+- 適合需要高精準度且有性能要求的場景
+
+**SPLADE**（Sparse Lexical and Expansion）：
+- 結合稀疏檢索（類 BM25）和深度學習
+- 可解釋性強，適合需要理解檢索原因的場景
+
+### 預期效果總覽
+
+| 改進階段 | 召回率提升 | 精準度提升 | 實作時間 | 優先級 |
+|---------|-----------|-----------|---------|--------|
+| **階段一**（RRF + BM25 + 快取） | +15-20% | +10-15% | 2 週 | 🔴 高 |
+| **階段二**（Reranking + Multi-Query + 自適應） | +25-30% | +20-25% | 4 週 | 🔴 高 |
+| **階段三**（評估框架 + 先進模型） | +5-10% | +5-10% | 8+ 週 | 🟡 中 |
+
+### 立即行動建議
+
+如果資源有限，**優先實作以下三項**：
+
+1. **Neo4j BM25**（最重要）
+   - 解決當前最致命的問題
+   - Neo4j 原生支援，相對容易
+   - 影響最大，基礎設施級別改進
+
+2. **RRF 融合**
+   - 數學上更合理
+   - 實作簡單，3 天內完成
+   - 立即改善評分機制
+
+3. **Cross-Encoder Reranking**
+   - 業界標準做法
+   - 精準度提升最明顯
+   - 需要額外依賴但效果顯著
+
+### 配置文件擴展
+
+在 `config.template.json` 新增檢索相關配置：
+
+```json
+{
+  "retrieval_settings": {
+    "strategy": "hybrid_rrf_rerank",
+    "enable_bm25": true,
+    "enable_semantic": true,
+    "enable_reranking": true,
+
+    "bm25_settings": {
+      "k1": 1.2,
+      "b": 0.75
+    },
+
+    "semantic_settings": {
+      "model": "text-embedding-3-small",
+      "similarity_threshold": 0.5,
+      "adaptive_threshold": true,
+      "top_k": 100
+    },
+
+    "rrf_settings": {
+      "k": 60,
+      "weight_bm25": 1.0,
+      "weight_semantic": 1.0
+    },
+
+    "reranking_settings": {
+      "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+      "rerank_top_k": 50,
+      "final_top_k": 15
+    },
+
+    "multi_query_settings": {
+      "enable": false,
+      "num_variations": 3
+    },
+
+    "cache_settings": {
+      "enable_embedding_cache": true,
+      "cache_size_limit": 1000
+    }
+  }
+}
+```
+
+### 參考資源
+
+**技術文件與最佳實踐**：
+- [RAG Production Guide 2026 | Lushbinary](https://lushbinary.com/blog/rag-retrieval-augmented-generation-production-guide/)
+- [Optimizing RAG with Hybrid Search & Reranking | Superlinked](https://superlinked.com/vectorhub/articles/optimizing-rag-with-hybrid-search-reranking)
+- [BM25 vs Hybrid Search in RAG | Medium](https://medium.com/@dewasheesh.rana/bm25-vs-sparse-vs-hybrid-search-in-rag-from-layman-to-pro-e34ff21c4ada)
+
+**Reciprocal Rank Fusion**：
+- [Advanced RAG: Understanding RRF | Glaforge.dev](https://glaforge.dev/posts/2026/02/10/advanced-rag-understanding-reciprocal-rank-fusion-in-hybrid-search/)
+- [RRF Mathematical Intuition | Medium](https://medium.com/@devalshah1619/mathematical-intuition-behind-reciprocal-rank-fusion-rrf-explained-in-2-mins-002df0cc5e2a)
+- [Better RAG Results With RRF | MongoDB](https://www.mongodb.com/resources/basics/reciprocal-rank-fusion)
+
+**Reranking 技術**：
+- [RAG-Fusion: Multi-query + RRF | arXiv](https://arxiv.org/abs/2402.03367)
+- [Advanced RAG: Hybrid Search and Re-ranking | DEV](https://dev.to/kuldeep_paul/advanced-rag-from-naive-retrieval-to-hybrid-search-and-re-ranking-4km3)
+
+---
+
 ## 配置管理
 
 ### config.json 結構
@@ -566,4 +1126,4 @@ Python 版本建議: **3.8+**
 此專案為內部使用系統，主要用於中興工程契約審查流程。
 
 **維護者**: [您的名稱]
-**最後更新**: 2026-01-13
+**最後更新**: 2026-05-11 (新增檢索系統深度分析與優化指南)

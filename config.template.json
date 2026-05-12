@@ -31,5 +31,37 @@
       "project_management",
       "design_supervision"
     ]
+  },
+
+  "retrieval_settings": {
+    "_comment": "檢索系統配置 - 控制混合搜尋、RRF 融合、BM25 等功能",
+
+    "enable_bm25": true,
+    "enable_rrf": true,
+
+    "bm25_settings": {
+      "_comment": "BM25 參數: k1 控制詞頻飽和度, b 控制文檔長度正規化",
+      "k1": 1.2,
+      "b": 0.75,
+      "top_k": 100
+    },
+
+    "rrf_settings": {
+      "_comment": "RRF 參數: k 為平滑常數(通常60), weights 控制不同檢索器的權重",
+      "k": 60,
+      "weight_keyword": 1.0,
+      "weight_semantic": 1.0
+    },
+
+    "cache_settings": {
+      "_comment": "快取設定: 啟用 embedding 快取以減少 API 呼叫和提升速度",
+      "enable_embedding_cache": true,
+      "cache_size_limit": 1000
+    }
   }
 }
+// "neo4j": {
+  //   "uri": "neo4j+s://567cbdc0.databases.neo4j.io",
+  //   "username": "neo4j",
+  //   "password": "2J07FuTnmvSypqXF7cQQbwNnCVUAr9Fu1RyXRcInx0E"
+  // },

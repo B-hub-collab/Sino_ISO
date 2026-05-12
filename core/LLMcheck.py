@@ -60,6 +60,120 @@ class JSONChecklistQuerySystem:
                             }
         return None
 
+    def create_fulltext_index(self):
+        """
+        建立 Neo4j 全文索引以支援 BM25 搜尋
+
+        注意：此方法應在上傳文件後執行一次
+        如果索引已存在會跳過
+        """
+        with self.driver.session() as session:
+            try:
+                # 檢查索引是否已存在
+                check_query = "SHOW INDEXES YIELD name WHERE name = 'clause_fulltext' RETURN count(*) as count"
+                result = session.run(check_query)
+                count = result.single()['count']
+
+                if count > 0:
+                    print("全文索引 'clause_fulltext' 已存在，跳過建立")
+                    return True
+
+                # 建立全文索引
+                create_query = """
+                CREATE FULLTEXT INDEX clause_fulltext IF NOT EXISTS
+                FOR (c:Clause)
+                ON EACH [c.title, c.content]
+                OPTIONS {
+                  indexConfig: {
+                    `fulltext.analyzer`: 'standard',
+                    `fulltext.eventually_consistent`: false
+                  }
+                }
+                """
+                session.run(create_query)
+                print("✅ 成功建立全文索引 'clause_fulltext'")
+                return True
+
+            except Exception as e:
+                print(f"建立全文索引時發生錯誤: {e}")
+                print("將使用傳統 CONTAINS 搜尋作為備用方案")
+                return False
+
+    def bm25_search(self, keywords: List[str], top_k: int = 100) -> List[Dict]:
+        """
+        使用 Neo4j BM25 全文索引搜尋相關條款
+
+        Args:
+            keywords: 關鍵字列表
+            top_k: 返回前 K 個結果
+
+        Returns:
+            依 BM25 分數排序的條款列表
+        """
+        if not keywords:
+            return []
+
+        # 將關鍵字組合成查詢字串
+        # 使用 OR 連接，讓任一關鍵字匹配即可
+        query_string = " OR ".join(keywords)
+
+        with self.driver.session() as session:
+            try:
+                # 使用全文索引搜尋
+                bm25_query = """
+                CALL db.index.fulltext.queryNodes('clause_fulltext', $query_string)
+                YIELD node, score
+                WITH node as c, score
+                MATCH (d:Document)-[:HAS_SECTION|HAS_CLAUSE*]->(c)
+                RETURN c.number as number,
+                       c.title as title,
+                       c.content as content,
+                       c.major_title as major_title,
+                       score as bm25_score,
+                       CASE
+                         WHEN d.type = 'contract' THEN 'contract'
+                         WHEN d.type = 'bidding_document' THEN
+                           CASE
+                             WHEN (c)<-[:HAS_CLAUSE]-(:Section {name: '補充投標須知'}) THEN 'supplement_notice'
+                             ELSE 'bidding_notice'
+                           END
+                         WHEN d.type = 'appendix_a' THEN 'appendix_a'
+                         ELSE 'unknown'
+                       END as source
+                ORDER BY score DESC
+                LIMIT $top_k
+                """
+
+                result = session.run(bm25_query, query_string=query_string, top_k=top_k)
+
+                clauses = []
+                for record in result:
+                    clauses.append({
+                        'number': record['number'],
+                        'title': record['title'],
+                        'content': record['content'],
+                        'major_title': record.get('major_title', ''),
+                        'source': record['source'],
+                        'bm25_score': float(record['bm25_score'])
+                    })
+
+                print(f"BM25 搜尋找到 {len(clauses)} 個條款（查詢: {query_string[:50]}...）")
+                if clauses:
+                    top_3_scores = [(c['number'], f"{c['bm25_score']:.3f}") for c in clauses[:3]]
+                    print(f"Top 3 BM25 分數: {top_3_scores}")
+
+                return clauses
+
+            except Exception as e:
+                error_msg = str(e)
+                if 'clause_fulltext' in error_msg or 'index' in error_msg.lower():
+                    print(f"⚠ BM25 搜尋失敗（索引可能不存在）: {error_msg}")
+                    print("→ 自動回退到傳統 CONTAINS 搜尋")
+                    return self.find_related_clauses(keywords)
+                else:
+                    print(f"BM25 搜尋錯誤: {e}")
+                    return []
+
     def find_related_clauses(self, keywords):
         """在所有文件中搜尋相關條款"""
         with self.driver.session() as session:
@@ -330,58 +444,188 @@ class JSONChecklistQuerySystem:
             print(f"語義搜尋錯誤: {e}")
             return []
 
-    def hybrid_search(self, keywords: List[str], query_text: str, top_k: int = 15) -> List[Dict]:
-        """混合搜尋：結合關鍵字搜尋和語義搜尋"""
+    def reciprocal_rank_fusion(
+        self,
+        keyword_results: List[Dict],
+        semantic_results: List[Dict],
+        k: int = 60,
+        weight_keyword: float = 1.0,
+        weight_semantic: float = 1.0
+    ) -> List[Dict]:
+        """
+        使用 Reciprocal Rank Fusion (RRF) 融合關鍵字和語義搜尋結果
+
+        RRF 公式: score = Σ weight / (k + rank)
+
+        Args:
+            keyword_results: 關鍵字搜尋結果（列表，順序即排名）
+            semantic_results: 語義搜尋結果（已按相似度排序）
+            k: RRF 平滑常數，通常設為 60
+            weight_keyword: 關鍵字搜尋的權重
+            weight_semantic: 語義搜尋的權重
+
+        Returns:
+            融合並按 RRF 分數排序的結果列表
+        """
+        rrf_scores = {}
+        clause_info = {}
+
+        # 處理關鍵字搜尋結果
+        for rank, result in enumerate(keyword_results, start=1):
+            key = f"{result['source']}_{result['number']}"
+            rrf_score = weight_keyword / (k + rank)
+            rrf_scores[key] = rrf_scores.get(key, 0) + rrf_score
+
+            # 儲存條款資訊（如果還沒有）
+            if key not in clause_info:
+                clause_info[key] = {
+                    'number': result['number'],
+                    'title': result['title'],
+                    'content': result['content'],
+                    'source': result['source'],
+                    'major_title': result.get('major_title', ''),
+                    'keyword_match': True,
+                    'semantic_match': False,
+                    'keyword_rank': rank,
+                    'semantic_rank': None,
+                    'semantic_score': 0.0
+                }
+            else:
+                clause_info[key]['keyword_match'] = True
+                clause_info[key]['keyword_rank'] = rank
+
+        # 處理語義搜尋結果
+        for rank, result in enumerate(semantic_results, start=1):
+            key = f"{result['source']}_{result['number']}"
+            rrf_score = weight_semantic / (k + rank)
+            rrf_scores[key] = rrf_scores.get(key, 0) + rrf_score
+
+            # 儲存或更新條款資訊
+            if key not in clause_info:
+                clause_info[key] = {
+                    'number': result['number'],
+                    'title': result['title'],
+                    'content': result['content'],
+                    'source': result['source'],
+                    'major_title': result.get('major_title', ''),
+                    'keyword_match': False,
+                    'semantic_match': True,
+                    'keyword_rank': None,
+                    'semantic_rank': rank,
+                    'semantic_score': result.get('similarity_score', 0.0)
+                }
+            else:
+                clause_info[key]['semantic_match'] = True
+                clause_info[key]['semantic_rank'] = rank
+                clause_info[key]['semantic_score'] = result.get('similarity_score', 0.0)
+
+        # 合併資訊和分數
+        final_results = []
+        for key, info in clause_info.items():
+            info['rrf_score'] = rrf_scores[key]
+            info['final_score'] = rrf_scores[key]  # 使用 RRF 分數作為最終分數
+            final_results.append(info)
+
+        # 按 RRF 分數排序
+        final_results.sort(key=lambda x: x['rrf_score'], reverse=True)
+
+        # 輸出調試資訊
+        print(f"RRF 融合: 關鍵字 {len(keyword_results)} 個 + 語義 {len(semantic_results)} 個 = {len(final_results)} 個唯一條款")
+        if final_results:
+            top_3 = final_results[:3]
+            print(f"Top 3 RRF 分數:")
+            for i, r in enumerate(top_3, 1):
+                match_type = []
+                if r['keyword_match']:
+                    match_type.append(f"關鍵字#{r['keyword_rank']}")
+                if r['semantic_match']:
+                    match_type.append(f"語義#{r['semantic_rank']}")
+                print(f"  {i}. {r['number']} - RRF={r['rrf_score']:.4f} ({', '.join(match_type)})")
+
+        return final_results
+
+    def hybrid_search(self, keywords: List[str], query_text: str, top_k: int = 15, use_rrf: bool = True, use_bm25: bool = True) -> List[Dict]:
+        """
+        混合搜尋：結合關鍵字搜尋和語義搜尋
+
+        Args:
+            keywords: 關鍵字列表
+            query_text: 查詢文本（用於語義搜尋）
+            top_k: 返回前 K 個結果
+            use_rrf: 是否使用 RRF 融合（預設 True）
+            use_bm25: 是否使用 BM25 全文索引（預設 True，如失敗會自動回退）
+
+        Returns:
+            排序後的檢索結果列表
+        """
         print(f"執行混合搜尋 - 關鍵字: {keywords}")
         print(f"查詢文本: {query_text}")
-        
-        # 1. 關鍵字搜尋 (現有邏輯)
-        keyword_results = self.find_related_clauses(keywords)
+        print(f"使用 RRF 融合: {use_rrf}, 使用 BM25: {use_bm25}")
+
+        # 1. 關鍵字搜尋（BM25 或傳統 CONTAINS）
+        if use_bm25:
+            keyword_results = self.bm25_search(keywords, top_k=100)
+        else:
+            keyword_results = self.find_related_clauses(keywords)
+
         print(f"關鍵字搜尋找到 {len(keyword_results)} 個條款")
-        
-        # 2. 語義搜尋
-        semantic_results = self.semantic_search(query_text, top_k=top_k)
+
+        # 2. 語義搜尋（擴大搜尋範圍以獲得更好的排名）
+        semantic_top_k = max(top_k * 3, 30)  # 至少搜尋 30 個
+        semantic_results = self.semantic_search(query_text, top_k=semantic_top_k)
         print(f"語義搜尋找到 {len(semantic_results)} 個條款")
-        
-        # 3. 合併結果並去重
-        combined_results = {}
-        
-        # 添加關鍵字搜尋結果（給予基礎分數1.0）
-        for clause in keyword_results:
-            key = f"{clause['source']}_{clause['number']}"
-            combined_results[key] = {
-                'number': clause['number'],
-                'title': clause['title'],
-                'content': clause['content'],
-                'source': clause['source'],
-                'keyword_match': True,
-                'semantic_score': 0.0,
-                'final_score': 1.0
-            }
-        
-        # 添加語義搜尋結果
-        for clause in semantic_results:
-            key = f"{clause['source']}_{clause['number']}"
-            if key in combined_results:
-                # 已存在，更新語義分數和最終分數
-                combined_results[key]['semantic_score'] = clause['similarity_score']
-                combined_results[key]['final_score'] = 1.0 + clause['similarity_score']  # 關鍵字+語義雙重匹配
-            else:
-                # 新增語義搜尋結果
+
+        # 3. 使用 RRF 融合或傳統方法融合
+        if use_rrf:
+            # 使用 RRF 融合
+            final_results = self.reciprocal_rank_fusion(
+                keyword_results=keyword_results,
+                semantic_results=semantic_results,
+                k=60,  # RRF 常數
+                weight_keyword=1.0,
+                weight_semantic=1.0
+            )
+        else:
+            # 傳統方法（向後相容）
+            print("使用傳統評分機制（不推薦）")
+            combined_results = {}
+
+            # 添加關鍵字搜尋結果（給予基礎分數1.0）
+            for clause in keyword_results:
+                key = f"{clause['source']}_{clause['number']}"
                 combined_results[key] = {
                     'number': clause['number'],
                     'title': clause['title'],
                     'content': clause['content'],
                     'source': clause['source'],
-                    'keyword_match': False,
-                    'semantic_score': clause['similarity_score'],
-                    'final_score': clause['similarity_score']
+                    'keyword_match': True,
+                    'semantic_score': 0.0,
+                    'final_score': 1.0
                 }
-        
-        # 排序並返回結果
-        final_results = list(combined_results.values())
-        final_results.sort(key=lambda x: x['final_score'], reverse=True)
-        
+
+            # 添加語義搜尋結果
+            for clause in semantic_results:
+                key = f"{clause['source']}_{clause['number']}"
+                if key in combined_results:
+                    # 已存在，更新語義分數和最終分數
+                    combined_results[key]['semantic_score'] = clause['similarity_score']
+                    combined_results[key]['final_score'] = 1.0 + clause['similarity_score']
+                else:
+                    # 新增語義搜尋結果
+                    combined_results[key] = {
+                        'number': clause['number'],
+                        'title': clause['title'],
+                        'content': clause['content'],
+                        'source': clause['source'],
+                        'keyword_match': False,
+                        'semantic_score': clause['similarity_score'],
+                        'final_score': clause['similarity_score']
+                    }
+
+            # 排序
+            final_results = list(combined_results.values())
+            final_results.sort(key=lambda x: x['final_score'], reverse=True)
+
         print(f"混合搜尋最終找到 {len(final_results)} 個條款")
         return final_results[:top_k]
 
